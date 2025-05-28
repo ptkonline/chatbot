@@ -1,223 +1,164 @@
+# ✅ Updated code with booking confirmation system
 import streamlit as st
-
-# Set page config first, before any other Streamlit commands
-st.set_page_config(
-    page_title="Hotel Receptionist AI",
-    page_icon="🏨",
-    layout="wide"
-)
-
-import sqlite3
+import os
 from datetime import datetime, timedelta
-from difflib import get_close_matches
-import re
-import pandas as pd
+from dotenv import load_dotenv
+import requests
+import json
 
-# --- Setup SQLite ---
-@st.cache_resource
-def init_db():
-    conn = sqlite3.connect("hotel_bookings.db", check_same_thread=False)
-    cursor = conn.cursor()
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS bookings (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            guest_count INTEGER,
-            room_type TEXT,
-            checkin_date TEXT,
-            checkout_date TEXT,
-            language TEXT,
-            status TEXT DEFAULT 'confirmed',
-            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
-        )
-    ''')
-    conn.commit()
-    return conn, cursor
+try:
+    import requests
+except ModuleNotFoundError:
+    st.warning("⚠️ The 'requests' module is not installed. Please run `pip install requests`.")
 
-conn, cursor = init_db()
+# Load environment variables
+load_dotenv()
 
-# --- Hotel Profile ---
-hotel_profile = {
-    "name": "Golden Tulip Lucknow",
-    "check_in": "2:00 PM",
-    "check_out": "11:00 AM",
-    "room_types": {
-        "single": {"price": 3000, "capacity": 1},
-        "double": {"price": 5000, "capacity": 2},
-        "deluxe": {"price": 8000, "capacity": 3}
-    }
-}
+# Configure DeepSeek API
+api_key = os.getenv("DEEPSEEK_API_KEY")
+if not api_key:
+    st.error("❌ DeepSeek API key not found. Please check your .env file.")
 
-# --- Language Responses ---
-responses = {
-    "greeting": {
-        "en": f"Welcome to {hotel_profile['name']}! How can I assist you today?",
-        "hi": f"{hotel_profile['name']} में आपका स्वागत है! मैं आपकी कैसे सहायता कर सकता हूं?",
-        "awa": f"{hotel_profile['name']} में आपका स्वागत बा! हमरा कइसे मदद कर सकत बानी?"
-    },
-    "checkin_info": {
-        "en": f"Check-in time is {hotel_profile['check_in']}, and check-out is by {hotel_profile['check_out']}.",
-        "hi": f"चेक-इन का समय {hotel_profile['check_in']} है, और चेक-आउट {hotel_profile['check_out']} तक है।",
-        "awa": f"चेक-इन {hotel_profile['check_in']} से होई, और चेक-आउट {hotel_profile['check_out']} तक होई।"
-    },
-    "booking_confirmation": {
-        "en": "Your booking has been confirmed! Here are the details:",
-        "hi": "आपका बुकिंग कन्फर्म हो गया है! यहाँ विवरण है:",
-        "awa": "आपका बुकिंग हो गईल बा! यहाँ सब जानकारी बा:"
-    },
-    "invalid_dates": {
-        "en": "Please provide valid check-in and check-out dates.",
-        "hi": "कृपया वैध चेक-इन और चेक-आउट तिथियां दें।",
-        "awa": "कृपया सही चेक-इन और चेक-आउट तारीख बताईए।"
-    },
-    "unknown": {
-        "en": "I'm sorry, I didn't understand that. Could you please rephrase?",
-        "hi": "क्षमा करें, मैं नहीं समझ पाया। क्या आप दोबारा बता सकते हैं?",
-        "awa": "कृपया करो, मैं ना बुझा पाएं। फिर से बताईए?"
-    }
-}
+# Initialize session state for bookings
+if "bookings" not in st.session_state:
+    st.session_state.bookings = []
 
-# --- Intent Keywords ---
-intent_keywords = {
-    "greeting": ["hello", "hi", "namaste", "राम राम", "नमस्ते"],
-    "checkin_info": ["check-in", "check out", "चेक-इन", "चेकआउट", "समय"],
-    "booking": ["room", "guests", "book", "सिंगल", "डबल", "room", "guest", "जन", "बुक"]
-}
-intent_map = {k: v for v, keys in intent_keywords.items() for k in keys}
+# Function to generate booking reference
+def generate_booking_ref():
+    return f"BK{datetime.now().strftime('%Y%m%d%H%M%S')}"
 
-# --- Extractors ---
-def identify_intent(text):
-    text = text.lower().strip()
-    for word in text.split():
-        match = get_close_matches(word, intent_map.keys(), n=1, cutoff=0.8)
-        if match:
-            return intent_map[match[0]]
-    return "unknown"
+# Function to save booking
+def save_booking(booking_data):
+    booking_data["booking_ref"] = generate_booking_ref()
+    booking_data["status"] = "confirmed"
+    booking_data["booking_date"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    st.session_state.bookings.append(booking_data)
+    return booking_data["booking_ref"]
 
-def extract_guest_count(text):
-    m = re.search(r"\b(\d{1,2})\b", text)
-    if m:
-        count = int(m.group(1))
-        return count if 1 <= count <= 4 else None
-    return None
-
-def extract_dates(text):
-    # Try multiple date formats
-    date_patterns = [
-        r"\b(\d{1,2})[\/\-. ](\d{1,2})[\/\-. ](\d{4})\b",  # DD/MM/YYYY
-        r"\b(\d{1,2})[\/\-. ](\d{1,2})\b",  # DD/MM
-        r"\b(\d{4})[\/\-. ](\d{1,2})[\/\-. ](\d{1,2})\b"   # YYYY/MM/DD
-    ]
-    
-    for pattern in date_patterns:
-        matches = re.findall(pattern, text)
-        if len(matches) >= 2:
-            try:
-                if len(matches[0]) == 3:  # Full date format
-                    ci = datetime.strptime("/".join(matches[0]), "%d/%m/%Y")
-                    co = datetime.strptime("/".join(matches[1]), "%d/%m/%Y")
-                else:  # Short date format
-                    ci = datetime.strptime("/".join(matches[0]), "%d/%m")
-                    co = datetime.strptime("/".join(matches[1]), "%d/%m")
-                    ci = ci.replace(year=datetime.now().year)
-                    co = co.replace(year=datetime.now().year)
-                
-                # Validate dates
-                if ci < datetime.now() or co <= ci:
-                    return None, None
-                return ci.strftime("%Y-%m-%d"), co.strftime("%Y-%m-%d")
-            except ValueError:
-                continue
-    return None, None
-
-def extract_room_type(text):
-    text = text.lower()
-    for rt in hotel_profile["room_types"].keys():
-        if rt in text:
-            return rt
-    return "double"  # Default room type
-
-def calculate_price(room_type, checkin, checkout):
-    checkin_date = datetime.strptime(checkin, "%Y-%m-%d")
-    checkout_date = datetime.strptime(checkout, "%Y-%m-%d")
-    nights = (checkout_date - checkin_date).days
-    return hotel_profile["room_types"][room_type]["price"] * nights
-
-# --- Chatbot Logic ---
-def handle_query(text, lang):
-    intent = identify_intent(text)
-    
-    if intent == "greeting":
-        return responses["greeting"][lang]
-    elif intent == "checkin_info":
-        return responses["checkin_info"][lang]
-    elif intent == "booking":
-        guests = extract_guest_count(text)
-        checkin, checkout = extract_dates(text)
-        room_type = extract_room_type(text)
-        
-        if not guests or not checkin or not checkout:
-            return {
-                "en": "Please provide: number of guests (1-4), room type, and valid check-in/check-out dates.",
-                "hi": "कृपया दें: अतिथियों की संख्या (1-4), रूम टाइप, और वैध चेक-इन/चेक-आउट तिथियां।",
-                "awa": "कृपया बताईए: जन की संख्या (1-4), रूम टाइप, और सही चेक-इन/चेक-आउट तारीख।"
-            }[lang]
-        
-        # Validate room capacity
-        if guests > hotel_profile["room_types"][room_type]["capacity"]:
-            return {
-                "en": f"Sorry, {room_type} room can only accommodate {hotel_profile['room_types'][room_type]['capacity']} guests.",
-                "hi": f"क्षमा करें, {room_type} रूम में केवल {hotel_profile['room_types'][room_type]['capacity']} अतिथि रह सकते हैं।",
-                "awa": f"माफ़ करीं, {room_type} रूम में {hotel_profile['room_types'][room_type]['capacity']} जन के लेला जगह बा।"
-            }[lang]
-        
-        # Calculate price
-        total_price = calculate_price(room_type, checkin, checkout)
-        
-        # Store booking
-        cursor.execute("""
-            INSERT INTO bookings (guest_count, room_type, checkin_date, checkout_date, language)
-            VALUES (?, ?, ?, ?, ?)
-        """, (guests, room_type, checkin, checkout, lang))
-        conn.commit()
-        
-        # Return confirmation with details
-        return f"{responses['booking_confirmation'][lang]}\n" + {
-            "en": f"• Guests: {guests}\n• Room: {room_type}\n• Check-in: {checkin}\n• Check-out: {checkout}\n• Total: ₹{total_price}",
-            "hi": f"• अतिथि: {guests}\n• रूम: {room_type}\n• चेक-इन: {checkin}\n• चेक-आउट: {checkout}\n• कुल: ₹{total_price}",
-            "awa": f"• जन: {guests}\n• रूम: {room_type}\n• चेक-इन: {checkin}\n• चेक-आउट: {checkout}\n• कुल: ₹{total_price}"
+# Define DeepSeek API function
+def ask_deepseek(user_query, lang='en'):
+    if not api_key:
+        return {
+            "en": "DeepSeek API key not found. Please check your .env file.",
+            "hi": "DeepSeek API कुंजी नहीं मिली। कृपया अपनी .env फ़ाइल की जाँच करें।",
+            "awa": "DeepSeek API कुंजी नाहीं मिलल। कृपया .env फ़ाइल देखीं।"
         }[lang]
-    
-    return responses["unknown"][lang]
 
-# --- Streamlit UI ---
+    try:
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json"
+        }
+        
+        data = {
+            "model": "deepseek-chat",
+            "messages": [
+                {
+                    "role": "system",
+                    "content": f"""You are a helpful hotel receptionist in Lucknow, India. Answer in {lang}. You have knowledge about two main hotels:
 
-# Sidebar
+1. Golden Tulip Lucknow:
+- 4-star business hotel
+- Check-in: 2:00 PM, Check-out: 11:00 AM
+- Features: Free Wi-Fi, AC, rooftop swimming pool, secure parking, airport shuttle
+- Restaurant 'Branche': Open 7:00 AM - 11:00 PM, serves buffet breakfast
+- Nearby attractions: Bara Imambara, Rumi Darwaza (10-15 min drive), Hazratganj Market (3 km)
+- Simple Booking Process:
+  * Check-in: 2:00 PM onwards
+  * Check-out: By 11:00 AM
+  * Room Types: Single, Double, Suite
+  * Special Requests: Early check-in, late check-out, extra bed, airport pickup
+
+2. Saraca Hotel Lucknow:
+- Heritage hotel with art-modern architecture
+- 41 beautiful rooms
+- Features: Free Wi-Fi, outdoor swimming pool, 24-hour gym
+- Restaurant 'Azrak': Serves Indian cuisine, open all day
+- Check-in: 2:00 PM, Check-out: 12:00 PM
+- Simple Booking Process:
+  * Check-in: 2:00 PM onwards
+  * Check-out: By 12:00 PM
+  * Room Types: Single, Double, Family Suite
+  * Special Requests: Early check-in, late check-out, extra bed, airport pickup
+
+Quick Booking Guide:
+1. Choose your dates
+2. Select room type
+3. Add any special requests
+4. Provide contact details
+5. Confirm booking
+
+When a guest wants to make a booking, ask for:
+- Hotel preference (Golden Tulip or Saraca)
+- Check-in date
+- Check-out date
+- Room type
+- Number of guests
+- Contact details (name, phone, email)
+- Any special requests
+
+Be friendly and helpful. If asked about specific hotels, provide accurate information. For general queries, you can mention both hotels' features. Always maintain a professional yet warm tone."""
+                },
+                {
+                    "role": "user",
+                    "content": user_query
+                }
+            ]
+        }
+        
+        response = requests.post(
+            "https://api.deepseek.com/v1/chat/completions",
+            headers=headers,
+            json=data
+        )
+        
+        if response.status_code == 200:
+            return response.json()["choices"][0]["message"]["content"].strip()
+        else:
+            error_msg = f"API Error: {response.status_code} - {response.text}"
+            st.error(error_msg)
+            return {
+                "en": f"Sorry, I couldn't get a response right now. {error_msg}",
+                "hi": f"क्षमा करें, अभी जवाब नहीं मिल पाया। {error_msg}",
+                "awa": f"माफ करिए, जवाब नाहीं मिल पाइल बा। {error_msg}"
+            }[lang]
+
+    except Exception as e:
+        error_msg = str(e)
+        print("DeepSeek Error:", error_msg)
+        st.error(f"API Error: {error_msg}")
+        return {
+            "en": f"Sorry, I couldn't get a response right now. Error: {error_msg}",
+            "hi": f"क्षमा करें, अभी जवाब नहीं मिल पाया। त्रुटि: {error_msg}",
+            "awa": f"माफ करिए, जवाब नाहीं मिल पाइल बा। त्रुटि: {error_msg}"
+        }[lang]
+
+# Sidebar: Current time display
 with st.sidebar:
-    st.title("🏨 Hotel Info")
-    st.write(f"**Hotel:** {hotel_profile['name']}")
-    st.write(f"**Check-in:** {hotel_profile['check_in']}")
-    st.write(f"**Check-out:** {hotel_profile['check_out']}")
+    now = datetime.now()
+    st.markdown(f"🕒 **Time:** {now.strftime('%A, %d %B %Y — %I:%M %p')}")
     
-    st.markdown("---")
-    st.subheader("Room Types & Prices")
-    for rt, info in hotel_profile["room_types"].items():
-        st.write(f"**{rt.title()}:** ₹{info['price']}/night (max {info['capacity']} guests)")
+    # Display booking history
+    if st.session_state.bookings:
+        st.markdown("### 📋 Recent Bookings")
+        for booking in st.session_state.bookings[-5:]:  # Show last 5 bookings
+            st.markdown(f"""
+            **Booking Ref:** {booking['booking_ref']}  
+            **Hotel:** {booking['hotel']}  
+            **Check-in:** {booking['check_in']}  
+            **Check-out:** {booking['check_out']}  
+            **Status:** {booking['status']}  
+            ---
+            """)
 
-# Main content
-st.title("🏨 Hotel Receptionist Chatbot")
-
-# Language selection
+# Language selection UI
 lang = st.selectbox(
     "Choose your language:",
     ["en", "hi", "awa"],
     format_func=lambda l: {"en": "English", "hi": "Hindi", "awa": "Awadhi"}[l]
 )
 
-# Chat interface
-st.markdown("---")
-st.subheader("💬 Chat with Receptionist")
-
-# Initialize chat history
+# Initialize chat state
 if "messages" not in st.session_state:
     st.session_state.messages = []
 
@@ -226,32 +167,48 @@ for message in st.session_state.messages:
     with st.chat_message(message["role"]):
         st.write(message["content"])
 
-# Chat input
+# Chat input box
 if prompt := st.chat_input("Type your message here..."):
-    # Add user message to chat history
-    st.session_state.messages.append({"role": "user", "content": prompt})
+    timestamp = datetime.now().strftime('%I:%M %p')
+    user_msg = f"🕒 {timestamp} — {prompt}"
+    st.session_state.messages.append({"role": "user", "content": user_msg})
     with st.chat_message("user"):
-        st.write(prompt)
-    
-    # Get and display assistant response
-    response = handle_query(prompt, lang)
-    st.session_state.messages.append({"role": "assistant", "content": response})
-    with st.chat_message("assistant"):
-        st.write(response)
+        st.write(user_msg)
 
-# Booking records
-st.markdown("---")
-st.subheader("📋 Recent Bookings")
-if st.checkbox("Show booking records"):
-    bookings = cursor.execute("""
-        SELECT guest_count, room_type, checkin_date, checkout_date, language, timestamp 
-        FROM bookings 
-        ORDER BY timestamp DESC 
-        LIMIT 10
-    """).fetchall()
-    
-    if bookings:
-        df = pd.DataFrame(bookings, columns=["Guests", "Room Type", "Check-in", "Check-out", "Language", "Timestamp"])
-        st.dataframe(df, use_container_width=True)
-    else:
-        st.info("No bookings found.") 
+    response = ask_deepseek(prompt, lang)
+    assistant_msg = f"🕒 {timestamp} — {response}"
+    st.session_state.messages.append({"role": "assistant", "content": assistant_msg})
+    with st.chat_message("assistant"):
+        st.write(assistant_msg)
+        
+        # If the response indicates a booking confirmation, show booking form
+        if "booking" in prompt.lower() or "book" in prompt.lower():
+            with st.form("booking_form"):
+                st.subheader("📝 Booking Form")
+                hotel = st.selectbox("Select Hotel", ["Golden Tulip Lucknow", "Saraca Hotel Lucknow"])
+                check_in = st.date_input("Check-in Date", min_value=datetime.now())
+                check_out = st.date_input("Check-out Date", min_value=check_in + timedelta(days=1))
+                room_type = st.selectbox("Room Type", ["Single", "Double", "Suite", "Family Suite"])
+                guests = st.number_input("Number of Guests", min_value=1, max_value=4)
+                name = st.text_input("Full Name")
+                phone = st.text_input("Phone Number")
+                email = st.text_input("Email")
+                special_requests = st.text_area("Special Requests")
+                
+                if st.form_submit_button("Confirm Booking"):
+                    booking_data = {
+                        "hotel": hotel,
+                        "check_in": check_in.strftime("%Y-%m-%d"),
+                        "check_out": check_out.strftime("%Y-%m-%d"),
+                        "room_type": room_type,
+                        "guests": guests,
+                        "name": name,
+                        "phone": phone,
+                        "email": email,
+                        "special_requests": special_requests
+                    }
+                    
+                    booking_ref = save_booking(booking_data)
+                    st.success(f"✅ Booking confirmed! Your booking reference is: {booking_ref}")
+                    st.balloons()
+
