@@ -2,7 +2,6 @@
 import streamlit as st
 import os
 from datetime import datetime, timedelta
-from dotenv import load_dotenv
 import requests
 import json
 
@@ -170,13 +169,13 @@ try:
 except ModuleNotFoundError:
     st.warning("⚠️ The 'requests' module is not installed. Please run `pip install requests`.")
 
-# Load environment variables
-load_dotenv()
-
 # Configure DeepSeek API
-api_key = os.getenv("DEEPSEEK_API_KEY")
+try:
+    api_key = st.secrets["DEEPSEEK_API_KEY"]
+except Exception:
+    api_key = None
 if not api_key:
-    st.error("❌ DeepSeek API key not found. Please check your .env file.")
+    st.error("❌ DeepSeek API key not found. Please add it to Streamlit secrets.")
 
 # Initialize all session state variables at the start
 if "messages" not in st.session_state:
